@@ -30,10 +30,14 @@ pytestmark = pytest.mark.skipif(not R.MODEL.exists(),
                                 reason="model not generated")
 
 
+_SCENE = []
+
+
 @pytest.fixture(scope="module")
 def system():
     cid = p.connect(p.DIRECT)
     scene = R.assemble(closed=True)
+    _SCENE.clear(); _SCENE.append(scene)
     M = C.system_mass_matrix(scene)
     J = C.constraint_jacobian(scene)
     # Movable joints run left arm 7, left fingers 2, right arm 7, right
@@ -207,3 +211,53 @@ def test_a_corrupted_mass_matrix_is_absorbed_by_both(system):
     assert r["relative"] < 1e-10
     good = C.compare(M, tau, J)
     assert np.abs(r["lagrange"] - good["lagrange"]).max() > 1e-6
+
+
+# ------------------------------------------------- layers A and D on the pair
+
+def test_layer_a_momentum_rate_vanishes_through_both_derivations(system):
+    """No external wrench acts, so both momentum rates must vanish.
+
+    The floor is Bullet's single precision, not this code. The constraint
+    Jacobian is differenced from positions, and the residual grows as the step
+    shrinks: 1.2e-03 at 1e-5 against 6.4e-06 at 3e-3. That is cancellation,
+    so the step is chosen at the bottom of that curve and the tolerance is set
+    from the measured floor rather than from a hoped-for zero.
+    """
+    import pybullet as pb
+    from src import reference as R2
+    M, tau, J = system
+    scene = _SCENE[0]
+    for solve in (C.solve_lagrange, C.solve_projection):
+        linear, angular = C.momentum_rate(scene, solve(M, tau, J))
+        assert np.linalg.norm(linear) < 1e-4, np.linalg.norm(linear)
+        assert np.linalg.norm(angular) < 1e-4, np.linalg.norm(angular)
+
+
+def test_layer_d_constraint_forces_do_no_work(system):
+    M, tau, J = system
+    n, m = M.shape[0], J.shape[0]
+    K = np.zeros((n + m, n + m))
+    K[:n, :n] = M
+    K[:n, n:] = J.T
+    K[n:, :n] = J
+    solution, *_ = np.linalg.lstsq(K, np.concatenate([tau, np.zeros(m)]), rcond=None)
+    multipliers = solution[n:]
+    for seed in range(6):
+        qdot = C.admissible_velocity(J, seed=seed)
+        assert np.abs(J @ qdot).max() < 1e-12
+        assert abs(float(qdot @ (J.T @ multipliers))) < 1e-12
+
+
+def test_layer_d_can_fail_on_an_inadmissible_velocity(system):
+    """The vacuity guard: a velocity that violates the constraint must do work
+    against the constraint forces, or the check above is measuring nothing."""
+    M, tau, J = system
+    n, m = M.shape[0], J.shape[0]
+    K = np.zeros((n + m, n + m))
+    K[:n, :n] = M
+    K[:n, n:] = J.T
+    K[n:, :n] = J
+    solution, *_ = np.linalg.lstsq(K, np.concatenate([tau, np.zeros(m)]), rcond=None)
+    inadmissible = np.ones(n) / np.sqrt(n)
+    assert abs(float(inadmissible @ (J.T @ solution[n:]))) > 1e-6

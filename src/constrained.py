@@ -70,42 +70,101 @@ def system_mass_matrix(scene) -> np.ndarray:
     return M
 
 
-def constraint_jacobian(scene) -> np.ndarray:
+def _grasp_state(scene, prefix):
+    state = p.getLinkState(scene.body, scene.links[f"{prefix}_panda_hand"])
+    return (np.array(state[4]),
+            np.array(p.getMatrixFromQuaternion(state[5])).reshape(3, 3))
+
+
+def _vee(S: np.ndarray) -> np.ndarray:
+    return np.array([S[2, 1] - S[1, 2], S[0, 2] - S[2, 0], S[1, 0] - S[0, 1]]) / 2.0
+
+
+def constraint_jacobian(scene, step: float = 3e-3) -> np.ndarray:
     """J_c, one 6-row block per grasp: the loop closure at velocity level.
 
     Each grasp says a material point on the hand and a material point on the
     module have the same linear velocity, and that the two bodies have the
-    same angular velocity. Six equations per hand, twelve in all.
+    same angular velocity. Six equations per hand, twelve in all. Column
+    layout is [robot base and joints | module linear | module angular].
 
-    Column layout is [robot base and joints | module linear | module angular],
-    matching `system_mass_matrix`.
+    The robot columns are built by finite difference of the grasp pose rather
+    than from `calculateJacobian`, which does not return what it appears to.
+    Checked against a finite difference of the grasp point at a random joint
+    velocity, its answer is 3.978e-02 m/s out with the localPosition given in
+    the centre of mass frame and 3.474e-02 out with [0, 0, 0] in the link
+    frame, and neither is the right point. The same call was already found
+    unusable in the momentum sum. What PyBullet does report reliably is
+    positions, which is why the closure error reads 0.000000 mm, so the
+    Jacobian is differenced from those.
     """
-    q = [p.getJointState(scene.body, j)[0]
-         for j in range(p.getNumJoints(scene.body))
-         if p.getJointInfo(scene.body, j)[2] != p.JOINT_FIXED]
-    zeros = [0.0] * len(q)
-    n_robot = len(q) + BASE_DOF
-
+    movable = [j for j in range(p.getNumJoints(scene.body))
+               if p.getJointInfo(scene.body, j)[2] != p.JOINT_FIXED]
+    q0 = [p.getJointState(scene.body, j)[0] for j in movable]
+    base_position, base_orientation = p.getBasePositionAndOrientation(scene.body)
+    n_robot = len(movable) + BASE_DOF
     module_com = np.array(p.getBasePositionAndOrientation(scene.module)[0])
+
+    reference = {k: _grasp_state(scene, k) for k in ("left", "right")}
+    columns = {k: np.zeros((6, n_robot)) for k in ("left", "right")}
+
+    # Central differences, and the step is 1e-3 rather than something smaller
+    # because Bullet computes in single precision. A one-sided difference at
+    # 1e-6 on positions of order half a metre is mostly cancellation noise:
+    # it returned base linear columns of 1.013 where they must be exactly 1,
+    # and base angular rows off the identity by 0.12. The error is 1 to 5 per
+    # cent, which is float epsilon divided by the step, not a modelling gap.
+    def half(prefix, sign):
+        position, rotation = _grasp_state(scene, prefix)
+        return position * sign, rotation, sign
+
+    def difference(prefix, plus, minus):
+        (p1, R1), (p0, R0) = plus[prefix], minus[prefix]
+        return np.concatenate([(p1 - p0) / (2 * step),
+                               _vee(R1 @ R0.T) / (2 * step)])
+
+    def sample():
+        return {k: _grasp_state(scene, k) for k in ("left", "right")}
+
+    # base angular, then base linear, matching PyBullet's own ordering
+    for axis in range(3):
+        taken = {}
+        for sign in (+1, -1):
+            delta = np.zeros(3); delta[axis] = sign * step
+            moved = p.multiplyTransforms([0, 0, 0],
+                                         p.getQuaternionFromEuler(list(delta)),
+                                         base_position, base_orientation)
+            p.resetBasePositionAndOrientation(scene.body, moved[0], moved[1])
+            taken[sign] = sample()
+        p.resetBasePositionAndOrientation(scene.body, base_position, base_orientation)
+        for k in columns:
+            columns[k][:, axis] = difference(k, taken[+1], taken[-1])
+    for axis in range(3):
+        taken = {}
+        for sign in (+1, -1):
+            shifted = np.array(base_position, float); shifted[axis] += sign * step
+            p.resetBasePositionAndOrientation(scene.body, list(shifted), base_orientation)
+            taken[sign] = sample()
+        p.resetBasePositionAndOrientation(scene.body, base_position, base_orientation)
+        for k in columns:
+            columns[k][:, 3 + axis] = difference(k, taken[+1], taken[-1])
+    for index, joint in enumerate(movable):
+        taken = {}
+        for sign in (+1, -1):
+            p.resetJointState(scene.body, joint, q0[index] + sign * step)
+            taken[sign] = sample()
+        p.resetJointState(scene.body, joint, q0[index])
+        for k in columns:
+            columns[k][:, BASE_DOF + index] = difference(k, taken[+1], taken[-1])
+
     rows = []
     for prefix in ("left", "right"):
-        link = scene.links[f"{prefix}_panda_hand"]
-        state = p.getLinkState(scene.body, link)
-        com, grasp = np.array(state[0]), np.array(state[4])
-        R_com = np.array(p.getMatrixFromQuaternion(state[1])).reshape(3, 3)
-        # calculateJacobian takes the point in the link's CoM frame, the same
-        # frame createConstraint uses and a different one from getLinkState[4].
-        local = R_com.T @ (grasp - com)
-        linear, angular = p.calculateJacobian(scene.body, link, list(local),
-                                              q, zeros, zeros)
-        linear, angular = np.array(linear), np.array(angular)
-
+        grasp = reference[prefix][0]
         r = grasp - module_com
         block = np.zeros((6, n_robot + MODULE_DOF))
-        block[:3, :n_robot] = linear
+        block[:, :n_robot] = columns[prefix]
         block[:3, n_robot:n_robot + 3] = -np.eye(3)
         block[:3, n_robot + 3:] = skew(r)
-        block[3:, :n_robot] = angular
         block[3:, n_robot + 3:] = -np.eye(3)
         rows.append(block)
     return np.vstack(rows)
