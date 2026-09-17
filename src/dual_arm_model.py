@@ -33,8 +33,25 @@ BUS_MASS = 200.0
 # Where each arm's base link is bolted to the bus, as (xyz, rpy). Mounted
 # facing each other across the bus so a module held between them closes a
 # loop, which is the configuration this project exists to study.
-LEFT_MOUNT = ((0.0, 0.30, 0.0), (0.0, 0.0, -1.5707963267948966))
-RIGHT_MOUNT = ((0.0, -0.30, 0.0), (0.0, 0.0, 1.5707963267948966))
+#
+# The spacing is derived, not chosen, by examples/derive_mount_spacing.py:
+#
+#   module across the grasped axis          0.4000 m
+#   hand frame to fingertip, measured       0.1142 m
+#   hand-frame separation at grasp          0.6285 m = 0.4000 + 2 x 0.1142
+#   max reach, measured off the model       1.1906 m
+#   mounts, for a 60% reach grasp at z=0.55 +/- 0.7701 m
+#
+# Sixty per cent is the objective rather than maximum margin. Maximising
+# margin puts the mounts directly outboard of the grasp points at +/- 0.3142,
+# where the arms stand folded and use 17 per cent of their reach: a distance
+# to the target says nothing about whether the posture holding it is usable.
+#
+# The gripper opens 0.0800 m and the module is 0.4000 m across, so the grasp
+# is on fixtures at the module's faces rather than on the module itself.
+MOUNT_Y = 0.7701
+LEFT_MOUNT = ((0.0, MOUNT_Y, 0.0), (0.0, 0.0, -1.5707963267948966))
+RIGHT_MOUNT = ((0.0, -MOUNT_Y, 0.0), (0.0, 0.0, 1.5707963267948966))
 
 BUS_LINK = "bus"
 _INERTIA_KEYS = ("ixx", "ixy", "ixz", "iyy", "iyz", "izz")
