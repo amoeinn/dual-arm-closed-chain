@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
+import numpy as np
+
 # The bus is a radius of gyration rather than a scaled pedestal, which is the
 # convention Project C settled on: I = m k^2 with k = 0.5 m.
 BUS_GYRATION_SQUARED = 0.25
@@ -318,6 +320,78 @@ def check_joint_limits(root: ET.Element, source_root: ET.Element,
                   f"{len(fingerprints)} distinguishable limit sets")
 
 
+def check_inertia_survives_loading(path, tolerance: float = 1e-9
+                                   ) -> Tuple[bool, str]:
+    """6. A consumer builds the inertia the file declares.
+
+    The other five properties are all read off the file, and the file can be
+    perfect while the thing loaded from it is not. PyBullet ignores declared
+    inertia by default and derives one from collision geometry; the bus has
+    none, so it is handed a default of 0.00013 kg m^2 against the 50.0
+    declared, wrong by a factor of 375,000, silently. Project C's notes list
+    this substitution and it still got past five file-level checks.
+
+    Skipped rather than failed when pybullet is absent, since the generator
+    itself needs nothing but the standard library.
+    """
+    try:
+        import pybullet as pb
+    except ImportError:
+        return True, "pybullet not installed, consumer check skipped"
+
+    declared = {}
+    for link in ET.parse(str(path)).getroot().findall("link"):
+        inertial = link.find("inertial")
+        if inertial is None:
+            continue
+        i = inertial.find("inertia")
+        g = lambda k: float(i.get(k))
+        tensor = np.array([[g("ixx"), g("ixy"), g("ixz")],
+                           [g("ixy"), g("iyy"), g("iyz")],
+                           [g("ixz"), g("iyz"), g("izz")]])
+        declared[link.get("name")] = (
+            float(inertial.find("mass").get("value")), tensor)
+
+    cid = pb.connect(pb.DIRECT)
+    try:
+        body = pb.loadURDF(str(path), useFixedBase=False,
+                           flags=pb.URDF_USE_INERTIA_FROM_FILE)
+        built = {pb.getBodyInfo(body)[0].decode():
+                 (pb.getDynamicsInfo(body, -1)[0],
+                  np.array(pb.getDynamicsInfo(body, -1)[2]))}
+        for j in range(pb.getNumJoints(body)):
+            info = pb.getJointInfo(body, j)
+            built[info[12].decode()] = (pb.getDynamicsInfo(body, j)[0],
+                                        np.array(pb.getDynamicsInfo(body, j)[2]))
+    finally:
+        pb.disconnect(cid)
+
+    # PyBullet stores an inertia tensor as principal moments plus the rotation
+    # that diagonalises them, so a tensor with off-diagonal terms survives the
+    # round trip only as well as its eigensolve does. The invariant is
+    # therefore the eigenvalues, not the declared diagonal entries, and the
+    # tolerance is the eigensolve floor Project C measured on this model
+    # rather than a constant picked to make the check pass.
+    floor = 5.802e-09
+    worst, worst_link = 0.0, None
+    for name, (mass, tensor) in declared.items():
+        if name not in built:
+            return False, f"{name} declared but not built"
+        got_mass, got_moments = built[name]
+        if abs(got_mass - mass) > tolerance:
+            return False, f"{name} mass: built {got_mass} against declared {mass}"
+        gap = float(np.max(np.abs(np.sort(got_moments)
+                                  - np.sort(np.linalg.eigvalsh(tensor)))))
+        if gap > worst:
+            worst, worst_link = gap, name
+    if worst > floor:
+        return False, (f"{worst_link}: principal moments differ from the "
+                       f"declared tensor's eigenvalues by {worst:.3e}, above "
+                       f"the {floor:.3e} eigensolve floor")
+    return True, (f"{len(declared)} links built as declared; worst principal "
+                  f"moment gap {worst:.3e} on {worst_link}, floor {floor:.3e}")
+
+
 def verify(path, source_urdf, arms: Sequence[ArmSpec] = DEFAULT_ARMS,
            bus_mass: float = BUS_MASS) -> Dict[str, Tuple[bool, str]]:
     """All five properties, as {name: (ok, detail)}."""
@@ -330,4 +404,5 @@ def verify(path, source_urdf, arms: Sequence[ArmSpec] = DEFAULT_ARMS,
     results["total mass"] = check_total_mass(root, source_root, arms, bus_mass)
     results["full inertia tensors"] = check_full_inertia_tensors(root, source_root)
     results["per joint limits"] = check_joint_limits(root, source_root, arms)
+    results["inertia survives loading"] = check_inertia_survives_loading(path)
     return results

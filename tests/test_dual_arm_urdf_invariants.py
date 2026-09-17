@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.dual_arm_model import (BUS_MASS, DEFAULT_ARMS, check_full_inertia_tensors,
+                                check_inertia_survives_loading,
                                 check_joint_limits, check_total_mass,
                                 check_two_chains, check_well_formed, compose,
                                 verify, write)
@@ -186,4 +187,38 @@ def test_all_five_properties_pass_together(model):
     results = verify(path, SOURCE, DEFAULT_ARMS, BUS_MASS)
     failed = {k: v for k, v in results.items() if not v[0]}
     assert not failed, failed
-    assert len(results) == 5
+    assert len(results) == 6
+
+
+def test_declared_inertia_survives_into_a_consumer(model):
+    path, _, _ = model
+    ok, detail = check_inertia_survives_loading(path)
+    assert ok, detail
+
+
+def test_the_consumer_check_catches_the_default_loader(model):
+    """The break this property exists to catch, and the reason it exists.
+
+    PyBullet ignores declared inertia unless URDF_USE_INERTIA_FROM_FILE is
+    passed, and derives one from collision geometry instead. The bus carries
+    no collision geometry, so it is handed 0.00013 kg m^2 against the 50.0
+    declared: wrong by a factor of 375,000, with no warning. Five file-level
+    properties all passed on that model, because the file was never the
+    problem.
+    """
+    pytest.importorskip("pybullet")
+    import pybullet as pb
+    path, _, _ = model
+    cid = pb.connect(pb.DIRECT)
+    try:
+        default = pb.loadURDF(str(path), useFixedBase=False)
+        declared_from_file = pb.loadURDF(
+            str(path), useFixedBase=False, flags=pb.URDF_USE_INERTIA_FROM_FILE)
+        bad = pb.getDynamicsInfo(default, -1)[2]
+        good = pb.getDynamicsInfo(declared_from_file, -1)[2]
+    finally:
+        pb.disconnect(cid)
+    assert max(good) > 100 * max(bad), (
+        f"the default loader was expected to substitute a much smaller bus "
+        f"inertia; got {bad} against {good}, so this check no longer "
+        f"demonstrates the substitution it exists to catch")
