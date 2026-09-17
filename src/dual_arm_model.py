@@ -36,22 +36,32 @@ BUS_MASS = 200.0
 # facing each other across the bus so a module held between them closes a
 # loop, which is the configuration this project exists to study.
 #
-# The spacing is derived, not chosen, by examples/derive_mount_spacing.py:
+# The spacing is derived, not chosen, by examples/derive_mount_spacing.py,
+# against poses the arms can legally hold:
 #
 #   module across the grasped axis          0.4000 m
 #   hand frame to fingertip, measured       0.1142 m
 #   hand-frame separation at grasp          0.6285 m = 0.4000 + 2 x 0.1142
-#   max reach, measured off the model       1.1906 m
-#   mounts, for a 60% reach grasp at z=0.55 +/- 0.7701 m
+#   mounts, most room at the binding joint  +/- 0.8000 m
 #
-# Sixty per cent is the objective rather than maximum margin. Maximising
-# margin puts the mounts directly outboard of the grasp points at +/- 0.3142,
-# where the arms stand folded and use 17 per cent of their reach: a distance
-# to the target says nothing about whether the posture holding it is usable.
+# Chosen by room at the binding joint, 1.0172 rad at right_panda_joint4, not
+# by a fraction of reach. An earlier version targeted 60 per cent of reach and
+# derived +/- 0.7701 m against poses with four of fourteen joints outside
+# their limits, two of them by more than 1.5 rad, because
+# calculateInverseKinematics ignores joint limits unless it is given them. The
+# reach fraction was a proxy for "not folded, not fully extended"; with the
+# ranges actually enforced that quantity can be measured directly, so the
+# proxy was dropped rather than forced.
+#
+# Roll about the palm axis is free and is swept rather than fixed: the grasp
+# is on a cylindrical fixture, so rotation about the approach axis does not
+# change it. Demanding one exact palm orientation asks six end-effector
+# degrees of freedom from seven joints twice over, and with limits enforced
+# that pins joints against their stops.
 #
 # The gripper opens 0.0800 m and the module is 0.4000 m across, so the grasp
 # is on fixtures at the module's faces rather than on the module itself.
-MOUNT_Y = 0.7701
+MOUNT_Y = 0.8000
 LEFT_MOUNT = ((0.0, MOUNT_Y, 0.0), (0.0, 0.0, -1.5707963267948966))
 RIGHT_MOUNT = ((0.0, -MOUNT_Y, 0.0), (0.0, 0.0, 1.5707963267948966))
 
@@ -392,6 +402,55 @@ def check_inertia_survives_loading(path, tolerance: float = 1e-9
                   f"moment gap {worst:.3e} on {worst_link}, floor {floor:.3e}")
 
 
+def check_no_pose_outside_joint_limits(path) -> Tuple[bool, str]:
+    """7. The nominal grasp pose is a posture the arms can legally hold.
+
+    Five of these properties read the file and the sixth reads what a
+    consumer builds from it. None of them looked at whether a pose the
+    project actually uses is attainable, and one was not:
+    calculateInverseKinematics ignores joint limits unless lowerLimits,
+    upperLimits, jointRanges and restPoses are all passed, so it returned
+    five poses at a 0.00 mm residual with four of fourteen joints outside
+    their range, two of them by more than 1.5 rad. Every margin quoted
+    against those poses was a statement about free space rather than about a
+    legal posture.
+    """
+    try:
+        import pybullet as pb
+    except ImportError:
+        return True, "pybullet not installed, pose check skipped"
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from src import posture
+
+    cid = pb.connect(pb.DIRECT)
+    try:
+        body = pb.loadURDF(str(path), useFixedBase=True,
+                           flags=pb.URDF_USE_INERTIA_FROM_FILE)
+        joints = {pb.getJointInfo(body, j)[1].decode(): j
+                  for j in range(pb.getNumJoints(body))}
+        links = {pb.getJointInfo(body, j)[12].decode(): j
+                 for j in range(pb.getNumJoints(body))}
+        half = 0.6285 / 2
+        targets = {"left": np.array([0.0, +half, 0.55]),
+                   "right": np.array([0.0, -half, 0.55])}
+        result = posture.solve_hands(body, joints, links, targets)
+        bad = posture.violations(body)
+    finally:
+        pb.disconnect(cid)
+
+    if bad:
+        detail = ", ".join(f"{n} at {q:+.4f} outside [{lo:+.3f}, {hi:+.3f}]"
+                           for n, q, lo, hi in bad)
+        return False, f"{len(bad)} joint(s) outside their limits: {detail}"
+    if result["position_error"] > 5e-3:
+        return False, (f"no legal posture reaches the grasp pose: "
+                       f"{result['position_error']*1000:.3f} mm")
+    return True, (f"grasp pose reached to {result['position_error']*1000:.3f} mm "
+                  f"with every joint inside its range, {result['binding_room']:.4f} "
+                  f"rad to spare at {result['binding_joint']}")
+
+
 def verify(path, source_urdf, arms: Sequence[ArmSpec] = DEFAULT_ARMS,
            bus_mass: float = BUS_MASS) -> Dict[str, Tuple[bool, str]]:
     """All five properties, as {name: (ok, detail)}."""
@@ -405,4 +464,5 @@ def verify(path, source_urdf, arms: Sequence[ArmSpec] = DEFAULT_ARMS,
     results["full inertia tensors"] = check_full_inertia_tensors(root, source_root)
     results["per joint limits"] = check_joint_limits(root, source_root, arms)
     results["inertia survives loading"] = check_inertia_survives_loading(path)
+    results["no pose outside joint limits"] = check_no_pose_outside_joint_limits(path)
     return results

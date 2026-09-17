@@ -210,6 +210,22 @@ def momentum_rate(scene, qddot: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
     linear = np.zeros(3)
     angular = np.zeros(3)
+
+    # The base link, which getNumJoints does not iterate over. Omitting it
+    # left 200 kg of a 235 kg system out of the momentum sum and made this
+    # layer report 9.4 N on an open chain driven by one internal torque.
+    # PyBullet orders the floating base as angular then linear, in the mass
+    # matrix and in the Jacobian alike, which is the opposite of the module
+    # block below.
+    base_mass = p.getDynamicsInfo(scene.body, -1)[0]
+    base_position, base_orientation = p.getBasePositionAndOrientation(scene.body)
+    base_alpha, base_a = qddot_robot[:3], qddot_robot[3:6]
+    R = np.array(p.getMatrixFromQuaternion(base_orientation)).reshape(3, 3)
+    base_inertia = R @ np.diag(p.getDynamicsInfo(scene.body, -1)[2]) @ R.T
+    linear += base_mass * base_a
+    angular += (np.cross(np.array(base_position), base_mass * base_a)
+                + base_inertia @ base_alpha)
+
     for link in range(p.getNumJoints(scene.body)):
         mass = p.getDynamicsInfo(scene.body, link)[0]
         if mass == 0.0:

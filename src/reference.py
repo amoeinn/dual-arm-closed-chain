@@ -37,6 +37,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pybullet as p
 
+from src import posture
+
 ROOT = Path(__file__).resolve().parent.parent
 MODEL = ROOT / "build" / "dual_arm_servicer.urdf"
 
@@ -128,7 +130,17 @@ def assemble(closed: bool = True, module_mass: float = MODULE_MASS,
     half = HAND_SEPARATION / 2.0
     targets = {"left": np.array([0.0, +half, grasp_height]),
                "right": np.array([0.0, -half, grasp_height])}
-    _solve_hands_to(body, joints, links, targets)
+    # Limits enforced, roll about the palm axis swept, result clamped. The
+    # previous local solver ignored joint limits and put four of fourteen
+    # joints outside their range, which PyBullet then clamped during
+    # simulation while the analytic mass matrix did not, so layers A and B
+    # could not agree with anything.
+    solved = posture.solve_hands(body, joints, links, targets)
+    posture.assert_within_limits(body, where="the grasp pose")
+    if solved["position_error"] > 5e-3:
+        raise AssertionError(
+            f"no legal posture reaches the grasp pose: "
+            f"{solved['position_error']*1000:.3f} mm")
 
     hands = {k: np.array(p.getLinkState(body, links[f"{k}_panda_hand"])[4])
              for k in targets}

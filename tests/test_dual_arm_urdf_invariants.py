@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.dual_arm_model import (BUS_MASS, DEFAULT_ARMS, check_full_inertia_tensors,
+                                check_no_pose_outside_joint_limits,
                                 check_inertia_survives_loading,
                                 check_joint_limits, check_total_mass,
                                 check_two_chains, check_well_formed, compose,
@@ -187,7 +188,7 @@ def test_all_five_properties_pass_together(model):
     results = verify(path, SOURCE, DEFAULT_ARMS, BUS_MASS)
     failed = {k: v for k, v in results.items() if not v[0]}
     assert not failed, failed
-    assert len(results) == 6
+    assert len(results) == 7
 
 
 def test_declared_inertia_survives_into_a_consumer(model):
@@ -222,3 +223,51 @@ def test_the_consumer_check_catches_the_default_loader(model):
         f"the default loader was expected to substitute a much smaller bus "
         f"inertia; got {bad} against {good}, so this check no longer "
         f"demonstrates the substitution it exists to catch")
+
+
+def test_the_grasp_pose_is_inside_every_joint_limit(model):
+    path, _, _ = model
+    ok, detail = check_no_pose_outside_joint_limits(path)
+    assert ok, detail
+
+
+def test_the_limit_check_catches_a_pose_outside_the_limits(model):
+    """The break it exists to catch: inverse kinematics without limits.
+
+    Solving the same grasp without lowerLimits and friends is what the first
+    version of this project did, and it is what produced a reach margin table
+    of five poses at a 0.00 mm residual with four joints out of range.
+    """
+    pytest.importorskip("pybullet")
+    import pybullet as pb
+    sys.path.insert(0, str(ROOT))
+    from src import posture
+    path, _, _ = model
+    cid = pb.connect(pb.DIRECT)
+    try:
+        body = pb.loadURDF(str(path), useFixedBase=True,
+                           flags=pb.URDF_USE_INERTIA_FROM_FILE)
+        joints = {pb.getJointInfo(body, j)[1].decode(): j
+                  for j in range(pb.getNumJoints(body))}
+        links = {pb.getJointInfo(body, j)[12].decode(): j
+                 for j in range(pb.getNumJoints(body))}
+        movable = posture.movable_joints(body)
+        dof = {j: k for k, j in enumerate(movable)}
+        half = 0.6285 / 2
+        # No limits passed, which is the defect.
+        for _ in range(20):
+            for prefix, sign in (("left", +1), ("right", -1)):
+                target = [0.0, sign * half, 0.55]
+                q = pb.calculateInverseKinematics(
+                    body, links[f"{prefix}_panda_hand"], target,
+                    pb.getQuaternionFromEuler(list(posture.PALM[prefix])),
+                    maxNumIterations=500, residualThreshold=1e-7)
+                for k in range(7):
+                    joint = joints[f"{prefix}_panda_joint{k+1}"]
+                    pb.resetJointState(body, joint, q[dof[joint]])
+        bad = posture.violations(body)
+    finally:
+        pb.disconnect(cid)
+    assert bad, ("inverse kinematics without limits stayed inside them at this "
+                 "pose, so this test no longer demonstrates the default it "
+                 "exists to catch")
