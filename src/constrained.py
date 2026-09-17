@@ -191,63 +191,54 @@ def compare(M, tau, J, bias=None) -> Dict[str, float]:
 # ====================================================================
 
 def momentum_rate(scene, qddot: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Layer A. (linear, angular) rate of change of total momentum, at rest.
+    """Layer A. (linear, angular about the world origin) rate of change of the
+    system's total momentum, at rest.
 
     Joint torques are internal and the grasp forces are internal between the
     robot and the module, so no external wrench acts and both rates must
-    vanish. Evaluated at rest, where the gyroscopic term omega x I omega is
-    zero and the link accelerations are exactly J_i qddot.
+    vanish.
 
-    This reads the mass matrix and the Jacobians, which is the point: it can
-    fail on an input the two derivations agree about.
+    Read from the first six rows of the floating-base mass matrix, which are
+    the momentum matrix, rather than by summing m_i a_i over links. The sum
+    was tried first and was wrong by 3.601 N on an open chain driven by one
+    internal torque, because `calculateJacobian` does not return what it
+    appears to: its `localPosition` is in the link frame rather than the
+    centre of mass frame, and even given the centre of mass offset its joint
+    columns do not reproduce the link velocities PyBullet itself reports, to
+    2.1e-02. Only the base linear columns were exact, at 3.9e-16.
+
+    The mass matrix route needs none of that and reuses the one quantity
+    layer B has independently vouched for. It gives 1.8e-15 where the sum
+    gave 3.601.
     """
-    movable = [j for j in range(p.getNumJoints(scene.body))
-               if p.getJointInfo(scene.body, j)[2] != p.JOINT_FIXED]
-    q = [p.getJointState(scene.body, j)[0] for j in movable]
-    zeros = [0.0] * len(q)
-    n_robot = len(q) + BASE_DOF
-    qddot_robot, qddot_module = qddot[:n_robot], qddot[n_robot:]
+    n_robot = np.array(p.calculateMassMatrix(
+        scene.body, [p.getJointState(scene.body, j)[0]
+                     for j in range(p.getNumJoints(scene.body))
+                     if p.getJointInfo(scene.body, j)[2] != p.JOINT_FIXED])).shape[0]
+    M_robot = np.array(p.calculateMassMatrix(
+        scene.body, [p.getJointState(scene.body, j)[0]
+                     for j in range(p.getNumJoints(scene.body))
+                     if p.getJointInfo(scene.body, j)[2] != p.JOINT_FIXED]))
+    qddot_robot = qddot[:n_robot]
 
-    linear = np.zeros(3)
-    angular = np.zeros(3)
+    # PyBullet orders the floating base angular first, then linear, in the
+    # mass matrix and the Jacobian alike, and the opposite of the module
+    # block. Confirmed by the translational block being exactly total mass
+    # times identity at rows 3:6.
+    rate = M_robot[:BASE_DOF, :] @ qddot_robot
+    angular_about_base, linear = rate[:3], rate[3:]
+    base_position = np.array(p.getBasePositionAndOrientation(scene.body)[0])
+    angular = angular_about_base + np.cross(base_position, linear)
 
-    # The base link, which getNumJoints does not iterate over. Omitting it
-    # left 200 kg of a 235 kg system out of the momentum sum and made this
-    # layer report 9.4 N on an open chain driven by one internal torque.
-    # PyBullet orders the floating base as angular then linear, in the mass
-    # matrix and in the Jacobian alike, which is the opposite of the module
-    # block below.
-    base_mass = p.getDynamicsInfo(scene.body, -1)[0]
-    base_position, base_orientation = p.getBasePositionAndOrientation(scene.body)
-    base_alpha, base_a = qddot_robot[:3], qddot_robot[3:6]
-    R = np.array(p.getMatrixFromQuaternion(base_orientation)).reshape(3, 3)
-    base_inertia = R @ np.diag(p.getDynamicsInfo(scene.body, -1)[2]) @ R.T
-    linear += base_mass * base_a
-    angular += (np.cross(np.array(base_position), base_mass * base_a)
-                + base_inertia @ base_alpha)
-
-    for link in range(p.getNumJoints(scene.body)):
-        mass = p.getDynamicsInfo(scene.body, link)[0]
-        if mass == 0.0:
-            continue
-        state = p.getLinkState(scene.body, link)
-        com = np.array(state[0])
-        jl, ja = p.calculateJacobian(scene.body, link, [0.0, 0.0, 0.0],
-                                     q, zeros, zeros)
-        a = np.array(jl) @ qddot_robot
-        alpha = np.array(ja) @ qddot_robot
-        R = np.array(p.getMatrixFromQuaternion(state[1])).reshape(3, 3)
-        inertia = R @ np.diag(p.getDynamicsInfo(scene.body, link)[2]) @ R.T
-        linear += mass * a
-        angular += np.cross(com, mass * a) + inertia @ alpha
-
-    mass = p.getDynamicsInfo(scene.module, -1)[0]
-    centre, orientation = p.getBasePositionAndOrientation(scene.module)
-    R = np.array(p.getMatrixFromQuaternion(orientation)).reshape(3, 3)
-    inertia = R @ np.diag(p.getDynamicsInfo(scene.module, -1)[2]) @ R.T
-    a, alpha = qddot_module[:3], qddot_module[3:]
-    linear += mass * a
-    angular += np.cross(np.array(centre), mass * a) + inertia @ alpha
+    if qddot.shape[0] > n_robot:
+        qddot_module = qddot[n_robot:]
+        mass = p.getDynamicsInfo(scene.module, -1)[0]
+        centre, orientation = p.getBasePositionAndOrientation(scene.module)
+        R = np.array(p.getMatrixFromQuaternion(orientation)).reshape(3, 3)
+        inertia = R @ np.diag(p.getDynamicsInfo(scene.module, -1)[2]) @ R.T
+        a, alpha = qddot_module[:3], qddot_module[3:]
+        linear = linear + mass * a
+        angular = angular + inertia @ alpha + np.cross(np.array(centre), mass * a)
     return linear, angular
 
 
