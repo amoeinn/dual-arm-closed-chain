@@ -179,3 +179,126 @@ def compare(M, tau, J, bias=None) -> Dict[str, float]:
             "relative": float(np.abs(a - b).max() / scale),
             "constraint_residual_lagrange": float(np.abs(J @ a).max()),
             "constraint_residual_projection": float(np.abs(J @ b).max())}
+
+
+# ====================================================================
+# Layers A, B and D, applied to the pair rather than to a simulator.
+#
+# The pair checks the solve against itself. These check the solve against
+# physics, which is the part the pair cannot reach: they read the shared
+# inputs, so a fault in the mass matrix or the constraint Jacobian shows up
+# here even though the two derivations agree about it.
+# ====================================================================
+
+def momentum_rate(scene, qddot: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Layer A. (linear, angular) rate of change of total momentum, at rest.
+
+    Joint torques are internal and the grasp forces are internal between the
+    robot and the module, so no external wrench acts and both rates must
+    vanish. Evaluated at rest, where the gyroscopic term omega x I omega is
+    zero and the link accelerations are exactly J_i qddot.
+
+    This reads the mass matrix and the Jacobians, which is the point: it can
+    fail on an input the two derivations agree about.
+    """
+    movable = [j for j in range(p.getNumJoints(scene.body))
+               if p.getJointInfo(scene.body, j)[2] != p.JOINT_FIXED]
+    q = [p.getJointState(scene.body, j)[0] for j in movable]
+    zeros = [0.0] * len(q)
+    n_robot = len(q) + BASE_DOF
+    qddot_robot, qddot_module = qddot[:n_robot], qddot[n_robot:]
+
+    linear = np.zeros(3)
+    angular = np.zeros(3)
+    for link in range(p.getNumJoints(scene.body)):
+        mass = p.getDynamicsInfo(scene.body, link)[0]
+        if mass == 0.0:
+            continue
+        state = p.getLinkState(scene.body, link)
+        com = np.array(state[0])
+        jl, ja = p.calculateJacobian(scene.body, link, [0.0, 0.0, 0.0],
+                                     q, zeros, zeros)
+        a = np.array(jl) @ qddot_robot
+        alpha = np.array(ja) @ qddot_robot
+        R = np.array(p.getMatrixFromQuaternion(state[1])).reshape(3, 3)
+        inertia = R @ np.diag(p.getDynamicsInfo(scene.body, link)[2]) @ R.T
+        linear += mass * a
+        angular += np.cross(com, mass * a) + inertia @ alpha
+
+    mass = p.getDynamicsInfo(scene.module, -1)[0]
+    centre, orientation = p.getBasePositionAndOrientation(scene.module)
+    R = np.array(p.getMatrixFromQuaternion(orientation)).reshape(3, 3)
+    inertia = R @ np.diag(p.getDynamicsInfo(scene.module, -1)[2]) @ R.T
+    a, alpha = qddot_module[:3], qddot_module[3:]
+    linear += mass * a
+    angular += np.cross(np.array(centre), mass * a) + inertia @ alpha
+    return linear, angular
+
+
+def open_chain_accelerations(scene, tau: np.ndarray,
+                             timestep: float = 1e-4) -> np.ndarray:
+    """Layer B. Joint accelerations PyBullet produces with the loop open.
+
+    PyBullet's open-chain integrator is the one part of it this project has
+    evidence for: the same harness that gains 15 kJ with the loop closed sits
+    at exactly rest with it open, 0.00000 mm and 0 J. So the open case is a
+    reference and the closed case is not, and the limit is worth checking
+    because the constrained solve must reduce to it when the constraint is
+    removed.
+
+    Measured by finite difference from rest rather than asked for directly,
+    since PyBullet exposes no forward dynamics call.
+    """
+    movable = [j for j in range(p.getNumJoints(scene.body))
+               if p.getJointInfo(scene.body, j)[2] != p.JOINT_FIXED]
+    for joint in movable:
+        p.setJointMotorControl2(scene.body, joint, p.VELOCITY_CONTROL,
+                                targetVelocity=0.0, force=0.0)
+    p.setTimeStep(timestep)
+    for k, joint in enumerate(movable):
+        p.setJointMotorControl2(scene.body, joint, p.TORQUE_CONTROL,
+                                force=float(tau[BASE_DOF + k]))
+    p.stepSimulation()
+    rates = np.array([p.getJointState(scene.body, j)[1] for j in movable])
+    base_v, base_w = p.getBaseVelocity(scene.body)
+    return np.concatenate([np.array(base_v) / timestep,
+                           np.array(base_w) / timestep,
+                           rates / timestep])
+
+
+def constraint_bias(scene, qdot: np.ndarray, step: float = 1e-6) -> np.ndarray:
+    """Jdot qdot, by finite difference of J along the motion.
+
+    Needed to integrate the constrained system away from rest. Differencing
+    the Jacobian is crude and its error is measured rather than assumed, by
+    halving the step and watching the answer settle.
+    """
+    movable = [j for j in range(p.getNumJoints(scene.body))
+               if p.getJointInfo(scene.body, j)[2] != p.JOINT_FIXED]
+    q0 = [p.getJointState(scene.body, j)[0] for j in movable]
+    base_position, base_orientation = p.getBasePositionAndOrientation(scene.body)
+    module_pose = p.getBasePositionAndOrientation(scene.module)
+
+    J0 = constraint_jacobian(scene)
+    for k, joint in enumerate(movable):
+        p.resetJointState(scene.body, joint, q0[k] + step * qdot[BASE_DOF + k])
+    J1 = constraint_jacobian(scene)
+    for k, joint in enumerate(movable):
+        p.resetJointState(scene.body, joint, q0[k])
+    p.resetBasePositionAndOrientation(scene.body, base_position, base_orientation)
+    p.resetBasePositionAndOrientation(scene.module, *module_pose)
+    return ((J1 - J0) / step) @ qdot
+
+
+def admissible_velocity(J: np.ndarray, seed: int = 0) -> np.ndarray:
+    """A random qdot satisfying J qdot = 0, from the null space of J.
+
+    An initial velocity that violates the constraint makes an energy check
+    measure the recovery from that violation, which is the mistake that made
+    PyBullet's closed scene look worse than it is.
+    """
+    _, _, vh = np.linalg.svd(J)
+    null_space = vh[J.shape[0]:].T
+    coefficients = np.random.default_rng(seed).normal(size=null_space.shape[1])
+    qdot = null_space @ coefficients
+    return qdot / np.linalg.norm(qdot)

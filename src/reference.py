@@ -173,7 +173,7 @@ def assemble(closed: bool = True, module_mass: float = MODULE_MASS,
             # of mass while the child offset was computed from the link frame,
             # which builds a 31.62 mm violation into the constraint at rest:
             # 31.6 kN of constraint force before anything moves, on a
-            # redundant pair, and the scene leaves in three metres.
+            # tightly coupled pair, and the scene leaves in three metres.
             R_com = np.array(p.getMatrixFromQuaternion(com_orientation)).reshape(3, 3)
             scene_constraint = p.createConstraint(
                 body, link, module, -1, p.JOINT_FIXED, [0, 0, 0],
