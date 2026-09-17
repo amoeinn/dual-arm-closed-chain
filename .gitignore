@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# The dual-arm model is generated from Project C's identified URDF, which is
+# itself generated from the MoveIt panda xacro. Neither repository
+# redistributes Franka's model; both derive it from a package the reader
+# already has. Regenerating is one command.
+build/
