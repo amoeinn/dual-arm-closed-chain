@@ -207,3 +207,263 @@ ranging 5.38 to 21.72. A controller carrying the free-floating model through
 contact would be wrong about the base response by an order of magnitude, and
 wrong in a way no single gain retunes, since the ratio varies fourfold across
 directions.
+
+## Bugs found and fixed
+
+Sixteen, and what they have in common is worth naming before the list. Not one
+was a crash, and not one was found by reading code. Every one produced a
+plausible number that survived the checks a caller would make, and every one
+was found by two things that should agree failing to, or by a control that
+should have been trivial coming out wrong.
+
+They group into four families, and the grouping is more useful than the count.
+
+### The same frame distinction, five times
+
+PyBullet reports a centre of mass where a link frame is meant, and the two are
+31.62 mm apart on `panda_hand`.
+
+`getLinkState` index 0 is the link's centre of mass and index 4 is the link
+frame. Comparing an inverse kinematics result against index 0 returned exactly
+31.62 mm for every target, which read as a solver that never converged. It had
+converged every time.
+
+`createConstraint` takes `parentFramePosition` in the link's centre of mass
+frame. Passing `[0, 0, 0]` while computing the child offset from the link frame
+built a 31.62 mm violation into the closure: **31.6 kN of constraint force on a
+system at rest**, and a scene that left in three metres.
+
+The guard watching that closure measured a parallel quantity, hand-to-centre
+distance against a nominal, and **read 0.00001 mm while the constraint it was
+watching was 31.62 mm out**. A guard that measures something else reports that
+everything is fine.
+
+And the momentum sum twice: once taking the link frame Jacobian where the
+centre of mass one was needed, and once more when the correction was applied to
+the wrong argument.
+
+### Two false accusations, which cost more than the real ones
+
+Twice this project concluded that `calculateJacobian` was unusable and should be
+replaced. It is correct. Given a `localPosition` of `[0, 0, 0]` it returns the
+Jacobian of the link **frame** origin, and against a central difference of that
+same point it agrees to 2.491e-05, which is the finite-difference floor in
+Bullet's single precision. It reads 1.239e-02 against the centre of mass
+because that is a different point. Both accusations were that comparison.
+
+These cost more than the genuine bugs. A real bug gets fixed; a wrongly blamed
+dependency gets replaced by something home made, which is what happened here
+before the comparison was checked. The rule the project now carries: before
+concluding a library is wrong, establish which point, frame and convention its
+answer is expressed in.
+
+### Guards that read as protection and were not
+
+The assertion that two chains agree about a shared joint's world frame is
+**unreachable** on the two-arm servicer, because the arms share no joints. It
+had never fired because it could not, which is not the same as passing. It is
+now tested on a topology where it can fire, wrist and elbow on one arm.
+
+`_assert_base_convention` was **checking the wrong arm**. Generalising the
+end-effector API added an `arm` parameter to the caller and not to the guard,
+so asking for arm 1 validated arm 0 and then used arm 1. The verdict happened
+to be the same, so nothing was wrong, but the guard was no longer checking the
+object it guards.
+
+And the reach margin table, five poses at a 0.00 mm residual, was meaningless:
+`calculateInverseKinematics` ignores joint limits unless `lowerLimits`,
+`upperLimits`, `jointRanges` and `restPoses` are **all** passed, and four of
+fourteen joints sat outside their range, two by more than 1.5 rad. Every margin
+described free space rather than a posture the arm could hold.
+
+### Six that stand alone
+
+**PyBullet ignores declared inertia** and derives its own from collision
+geometry. The bus has none, so it was built with 0.00013 kg m^2 against the
+50.0 declared, wrong by a factor of 375,000, silently, past five model checks
+that only read the file.
+
+**PyBullet's constraint solver cannot hold this closure.** A system at rest,
+zero torque, zero velocity, zero closure error, gains 15 kJ and travels 1.65 m.
+More solver iterations and shorter timesteps make it worse, which is not a
+convergence signature. That is why the second solver was dropped and the
+constrained solve written twice instead. The control that established it, a
+system at rest must stay at rest, should have been the first thing run and was
+not.
+
+**Finite differences at 1e-6 are mostly noise** when the library computes in
+single precision. Base columns that must be exactly the identity came back as
+1.013. Central differences at 1e-3 give 1.000002, and the error grows as the
+step shrinks, which is the signature of cancellation rather than truncation.
+
+**Velocity control over-constrains a closed loop.** Commanding fourteen arm
+rates independently describes a motion a closed loop cannot perform, and the
+solver resolves the contradiction with impulses: 16 kJ of kinetic energy at the
+first step against 0.07 kJ for the same command with the loop open. Nothing was
+wrong with the solver. The command was inconsistent, which is this project's
+own claim arriving early and in the test harness.
+
+**Position-only inverse kinematics put both forearms inside the payload.**
+Constraining hand position and leaving orientation free let the solver pick a
+wrist that folded link 5 and link 6 **74 mm into the module the hands are
+constrained to**. The pose reached its targets exactly and was physically
+impossible. Fixing the palm orientation resolved it, and only the hand and
+finger links are now filtered from collision so that an unintended contact
+anywhere else stays visible.
+
+**A figure caught what a total did not.** The mate result was published as
+105.84 mm of servicer displacement. That number looks unremarkable. Plotted, the
+curve had a near-vertical step in it at one waypoint, rising 57 mm to 105 mm,
+and the cause was the inverse kinematics changing posture branch: the joint
+vector jumped 4.876 rad in a single step against 0.11 either side. About 56 mm
+of the published figure belonged to the solver. The corrected value is 50 mm
+over a carry that is actually achievable.
+
+That is the case for plotting a result rather than tabulating it, and it is
+worth stating plainly: **a total hides its own shape**. Nothing about 105.84 mm
+invites suspicion. A curve with a cliff in it invites nothing else.
+
+## Tests
+
+71 tests in about 44 seconds. Every one is named for the invariant it protects
+rather than the function it calls, and **every one is paired with the specific
+break it exists to catch**, because a check that has never been shown to fail
+has not been shown to work.
+
+That discipline earned its cost twice in this project, and in both cases the
+mutation found the test rather than the code. One guard turned out to be
+unreachable on the model it shipped with. One mutation that was expected to
+surface as a disagreement turned out to be a change of gauge: flipping the sign
+of `J^T` in the saddle point matrix only flips the multipliers, so the
+accelerations came back 1.9e-13 apart, and the test written to catch it could
+never have fired.
+
+The suite also carries what the pair of derivations **cannot** check, asserted
+rather than described: both take the same mass matrix and constraint Jacobian,
+so corrupting either leaves them agreeing to 1e-14 and both wrong.
+
+Four things are deliberately left as scripts rather than promoted. The
+rank-loss search, at 295 seconds, whose result is a negative from a search and
+not an invariant; the thirteen-point mass ratio sweep, whose two ends are
+asserted and whose middle is a curve; the 200-step mate, which the tests do in
+20 at the same conclusion; and the mount spacing sweep, whose output is already
+pinned by a model property.
+
+## Limitations
+
+**No contact dynamics anywhere.** The two regimes either side of contact are
+measured and the boundary is characterised, but nothing integrates through it.
+What contact does to the model is stated exactly; what it does during is not
+modelled at all.
+
+**No controller.** Every result here says what a plant does, not whether
+something could fly it. That the pre-grasp model is worthless after the grasp
+is measured; that a berthing would fail is not claimed.
+
+**The grasp height and the fore-aft envelope are stated choices.** There is no
+berthing port specification behind `z = 0.55 m` or the envelope, so every reach
+margin is conditional on them. Given a port they become derived and the spacing
+is re-run rather than edited.
+
+**The grasp is on fixtures, by necessity.** The gripper opens 0.0800 m against
+a 0.4000 m module. Where those fixtures sit sets the loop geometry, so a
+different grasp scheme changes the constraint equations and not just the
+numbers.
+
+**The fore-aft envelope is asymmetric**, and the carry is bounded by posture
+rather than by reach. Forward reaches +0.60 m, aft does not reach -0.60 m, and
+a continuous carry without a posture change runs to 0.40 m, not further.
+
+**Rank loss was not found, which is not the same as absent.** Forty restarts of
+four hundred descent steps found no singular `H_bm` inside the joint limits. A
+harder search might.
+
+**Single precision is the floor on the constraint Jacobian.** It is
+differenced from positions because Bullet computes in floats, so layer A's
+closed-loop residual sits at 1e-06 rather than at machine precision, and that
+floor is measured rather than assumed.
+
+## Requirements
+
+Python 3.12, and the pins in `requirements.txt`: torch 2.14.0+cpu, pybullet
+3.2.7, numpy 2.5.2, matplotlib 3.11.2. `pytest 9.1.1` is in
+`requirements-dev.txt`. Everything runs on CPU.
+
+**MoveIt is required, and not for a ROS node.** See Running it below before
+starting.
+
+## Setup
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+```
+
+If ROS 2 is sourced in your shell, unset `PYTHONPATH` before running anything.
+pytest autoloads plugins from every `site-packages` on the path, finds a
+ROS-installed one, and fails with `ModuleNotFoundError: No module named 'yaml'`,
+which names `yaml` and says nothing about ROS.
+
+```bash
+PYTHONPATH= .venv/bin/python -m pytest tests/
+```
+
+## Running it
+
+**Read this before the first command.** The dual-arm model is generated, not
+committed, and the chain behind it reaches outside this repository:
+
+```
+MoveIt's moveit_resources_panda_description  (panda.urdf.xacro)
+  -> Project C expands it to panda_identified.urdf
+    -> this project composes two copies onto a bus
+```
+
+So a reader needs **MoveIt installed** and **Project C checked out beside this
+repository**, at `../free-floating-manipulation`. Neither repository
+redistributes Franka's model, which is why it is derived at runtime rather than
+committed, and that choice is what puts MoveIt on the requirements list.
+
+With those present:
+
+```bash
+.venv/bin/python examples/generate_dual_arm_urdf.py   # the model, seven properties
+.venv/bin/python examples/dimension_count.py          # what the second arm buys
+.venv/bin/python examples/grasp_transition.py         # the mass ratio sweep
+.venv/bin/python examples/berthing.py                 # the two regimes
+.venv/bin/python examples/derive_mount_spacing.py     # why the mounts are where they are
+.venv/bin/python examples/generate_figures.py         # the three figures above
+```
+
+`generate_dual_arm_urdf.py` must be run first; everything else loads what it
+writes. The rank-loss search inside `dimension_count.py` is the slowest thing
+here at about five minutes; the rest are seconds to a minute.
+
+## Structure
+
+```
+src/
+  dual_arm_model.py     generate the two-arm URDF, and the seven properties
+  posture.py            inverse kinematics that respects joint limits
+  reference.py          the free-floating scene, and layers A, B and D
+  constrained.py        the constrained solve, written twice
+  dimension.py          rank and null space of H_bm
+  grasp_transition.py   the plant before and after the module joins it
+  vendor/               kinematics.py and dynamics.py from Project C,
+                        with PROVENANCE.md naming every deviation
+examples/               one script per result, each printing what it measured
+tests/                  71 tests, each paired with the break it catches
+docs/                   the three figures, regenerable from examples/
+```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+This covers the code in this repository. The Franka Panda model is not included
+here: it is derived at runtime from MoveIt's
+`moveit_resources_panda_description`, and the kinematic and inertial values
+every result depends on are Franka Emika's, under their own terms. The two
+files under `src/vendor/` are copied from `free-floating-manipulation`, which
+is MIT and the same author's; `src/vendor/PROVENANCE.md` names the source
+commit and every deviation from it.
