@@ -51,20 +51,24 @@ def rig():
     pb.disconnect(cid)
 
 
-def _mate(rig, module_mass, steps=20, end_x=0.50):
+CARRY_ROLL = 4.7124   # the only roll continuously feasible out to 0.40 m
+
+
+def _mate(rig, module_mass, steps=20, end_x=0.40):
     scene, joints, links, arm, model, pick = rig
     base_ref = np.array(pb.getBasePositionAndOrientation(scene.body)[0])
     inertia = np.eye(3) * module_mass * 0.40 ** 2 / 6.0
 
-    def at(x):
+    def at(x, first=False):
         posture.solve_hands(scene.body, joints, links,
                             {"left": np.array([x, +HALF, R.GRASP_HEIGHT]),
                              "right": np.array([x, -HALF, R.GRASP_HEIGHT])},
-                            passes=4, rolls=3)
+                            passes=5 if first else 4, roll=CARRY_ROLL,
+                            seed_from_current=not first)
         return np.array([pb.getJointState(scene.body, j)[0] for j in arm])
 
     xs = np.linspace(0.0, end_x, steps + 1)
-    q_prev = at(xs[0])
+    q_prev = at(xs[0], first=True)
     true_shift = np.zeros(3)
     naive_shift = np.zeros(3)
     for x in xs[1:]:
@@ -81,6 +85,31 @@ def _mate(rig, module_mass, steps=20, end_x=0.50):
         naive_shift += -np.linalg.solve(composite["H_b_before"],
                                         composite["H_bm_before"] @ dq)[:3]
     return np.linalg.norm(true_shift), np.linalg.norm(naive_shift)
+
+
+def test_the_carry_is_one_continuous_posture(rig):
+    """No step in the joint path, or the drift integral measures the solver.
+
+    Solving each waypoint independently lets the chosen roll flip between
+    neighbours: 4.876 rad in one step against 0.11 either side, which
+    integrated into 56 mm of base motion that was not the servicer's.
+    """
+    scene, joints, links, arm, model, pick = rig
+    posture.solve_hands(scene.body, joints, links,
+                        {"left": np.array([0.0, +HALF, R.GRASP_HEIGHT]),
+                         "right": np.array([0.0, -HALF, R.GRASP_HEIGHT])},
+                        passes=5, roll=CARRY_ROLL)
+    previous = np.array([pb.getJointState(scene.body, j)[0] for j in arm])
+    worst = 0.0
+    for x in np.linspace(0.0, 0.40, 21)[1:]:
+        posture.solve_hands(scene.body, joints, links,
+                            {"left": np.array([x, +HALF, R.GRASP_HEIGHT]),
+                             "right": np.array([x, -HALF, R.GRASP_HEIGHT])},
+                            passes=4, roll=CARRY_ROLL, seed_from_current=True)
+        q = np.array([pb.getJointState(scene.body, j)[0] for j in arm])
+        worst = max(worst, float(np.linalg.norm(q - previous)))
+        previous = q
+    assert worst < 0.5, f"joint path steps by {worst:.4f} rad"
 
 
 def test_carrying_the_module_displaces_the_servicer(rig):

@@ -99,9 +99,11 @@ def clamp_to_limits(body: int, arms: Sequence[str] = ("left", "right")) -> int:
     return moved
 
 
-def _attempt(body, joints, links, targets, bounds, dof, roll, passes):
-    for k, joint in enumerate(movable_joints(body)):
-        p.resetJointState(body, joint, bounds["restPoses"][k])
+def _attempt(body, joints, links, targets, bounds, dof, roll, passes,
+             seed_from_current=False):
+    if not seed_from_current:
+        for k, joint in enumerate(movable_joints(body)):
+            p.resetJointState(body, joint, bounds["restPoses"][k])
     for _ in range(passes):
         for prefix, target in targets.items():
             rx, ry, rz = PALM[prefix]
@@ -125,7 +127,8 @@ def _attempt(body, joints, links, targets, bounds, dof, roll, passes):
 
 def solve_hands(body: int, joints: Dict[str, int], links: Dict[str, int],
                 targets: Dict[str, np.ndarray], passes: int = 12,
-                rolls: int = 12) -> Dict[str, float]:
+                rolls: int = 12, roll: Optional[float] = None,
+                seed_from_current: bool = False) -> Dict[str, float]:
     """Put both hands on their targets using a posture that is legal.
 
     Roll about the palm axis is swept rather than fixed. Demanding one exact
@@ -143,9 +146,19 @@ def solve_hands(body: int, joints: Dict[str, int], links: Dict[str, int],
     movable = movable_joints(body)
     dof = {j: k for k, j in enumerate(movable)}
     bounds = limits(body)
+    # Along a trajectory both of these matter. Sweeping the roll afresh at
+    # every waypoint lets the winner change between neighbours, and re-seeding
+    # from the rest pose lets the solver pick a different branch for the same
+    # target. Either produces a joint path with a step in it, which integrates
+    # into base motion that is an artifact of the solver rather than physics:
+    # measured at 4.876 rad in one step against 0.11 either side, where the
+    # chosen roll flipped from 4.712 to 0.000.
+    candidates = ([roll] if roll is not None
+                  else list(np.linspace(0.0, 2.0 * np.pi, rolls, endpoint=False)))
     best = None
-    for roll in np.linspace(0.0, 2.0 * np.pi, rolls, endpoint=False):
-        result = _attempt(body, joints, links, targets, bounds, dof, roll, passes)
+    for roll in candidates:
+        result = _attempt(body, joints, links, targets, bounds, dof, roll,
+                          passes, seed_from_current=seed_from_current)
         key = (result["violations"] > 0, result["position_error"])
         if best is None or key < (best["violations"] > 0, best["position_error"]):
             best = result
