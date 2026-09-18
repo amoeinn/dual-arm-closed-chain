@@ -21,6 +21,21 @@ Listed as they are made. Anything not listed is a copy.
    is documented as "shared by every link's Jacobian since every link is
    distal to all of them". False for two arms. Generalised to merge joint
    frames across all chains.
+
+   The merge carries an assertion that two chains reporting the same joint
+   agree about its world frame. **That assertion is unreachable on the
+   two-arm servicer** and Phase 7 found it by trying to mutate it. Both arms
+   hang off the bus through fixed mounts, so the left chain covers joints 1
+   to 7 and the right covers 13 to 19 with nothing in common, and the branch
+   never executes. It had never fired because it could not, which is not the
+   same as passing.
+
+   It is kept rather than deleted, because the generalisation is to N chains
+   and not to two arms specifically, and chains that share joints are an
+   ordinary topology: two end effectors on one arm, or arms on a common
+   turret. It is now tested on that topology, wrist and elbow on the left
+   arm, where the chains share joints 1 to 4 and the merge has real work to
+   do. Both the point and the axis halves of the disagreement are caught.
 2. `dynamics.py`, the end-effector API: `manipulator_jacobian`,
    `base_jacobian` and `generalized_jacobian` are singular in the source and
    become per-arm here.
