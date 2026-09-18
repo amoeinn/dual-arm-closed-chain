@@ -39,6 +39,39 @@ Listed as they are made. Anything not listed is a copy.
 2. `dynamics.py`, the end-effector API: `manipulator_jacobian`,
    `base_jacobian` and `generalized_jacobian` are singular in the source and
    become per-arm here.
+
+   This deviation quietly narrowed a guard, which Phase 7 found. The `arm`
+   parameter was added to `generalized_jacobian` and not to
+   `_assert_base_convention`, so calling the first with `arm=1` validated arm
+   0's `J_b` and then used arm 1's. The verdict happens to be the same on this
+   model, since the properties asserted are structural and hold for any end
+   effector, so nothing was wrong. But the guard was no longer checking the
+   object it guards. Corrected by passing `arm` through.
+
+## What inherited coverage does and does not vouch for
+
+The general point, recorded here because it applies to anything vendored and
+not only to these two guards.
+
+Project C's suite tests the guards in this file, and it tests them on a
+single-arm model. **Inherited coverage is coverage of the inherited
+configuration.** A guard that C exercises thoroughly may, in a copy that has
+been generalised, be unreachable, be reachable but never exercised, or be
+checking a different object from the one it protects. All three happened here:
+
+- The chain-disagreement assertion added with deviation 1 is **unreachable**
+  on the two-arm servicer, because the arms share no joints. C never had it,
+  so no coverage was inherited or lost; it simply had none.
+- `_assert_base_convention` was **checking the wrong arm** after deviation 2,
+  for the reason above.
+- The revolute-serial check and the base-reference branch are both reachable
+  and are now exercised here, but that was established by probing rather than
+  assumed from C's suite.
+
+So the rule this project follows: when a vendored file is modified, every
+guard in it is re-checked for reachability against the new configuration
+before its inherited coverage is credited. Checking is cheap. The failure it
+prevents is a guard that reads as protection and is not.
 3. `dynamics.py`: the import of `kinematics` is repointed from
    `src.kinematics` to `src.vendor.kinematics`. Path only.
 4. `kinematics.py`: **no change at all.** `ForwardKinematics.__init__` already

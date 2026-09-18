@@ -487,7 +487,8 @@ class FloatingBaseModel:
 
     # -------------------------------------------------- generalized Jacobian
 
-    def _assert_base_convention(self, q: torch.Tensor, fingers: str) -> None:
+    def _assert_base_convention(self, q: torch.Tensor, fingers: str,
+                                arm: int = 0) -> None:
         """Guard the one mistake that makes J_g the right shape and wrong
         everywhere: J_b and H_b disagreeing on the base-twist layout.
 
@@ -518,7 +519,7 @@ class FloatingBaseModel:
                 "H_b leading block is not total_mass.I; the base DoF are not "
                 "in the [linear, angular] order J_b assumes")
 
-        base_jacobian = self.base_jacobian(q)
+        base_jacobian = self.base_jacobian(q, arm=arm)
         if not torch.allclose(base_jacobian[:3, :3], eye3, atol=1e-9):
             raise AssertionError(
                 "J_b leading block is not I; base-twist order disagrees "
@@ -536,7 +537,10 @@ class FloatingBaseModel:
         The map from joint rates to end-effector velocity on the free
         floating base at zero total momentum.
         """
-        self._assert_base_convention(q, fingers)
+        # VENDOR DEVIATION 2, corrected: the guard must check the arm the
+        # caller asked for. Adding the arm parameter to the caller and not
+        # to the guard left it validating arm 0 and then using arm 1.
+        self._assert_base_convention(q, fingers, arm=arm)
         manipulator = self.manipulator_jacobian(q, arm=arm)
         base = self.base_jacobian(q, arm=arm)
         base_inertia, coupling = self.coupling(q, fingers=fingers)

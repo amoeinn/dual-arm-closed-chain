@@ -193,3 +193,80 @@ def test_a_source_with_two_roots_is_caught(tmp_path):
     ET.SubElement(root, "link", {"name": "orphan"})
     with pytest.raises(ValueError, match="one root link"):
         DAM._root_link_of(root)
+
+
+# ------------------------------------------- the two vendored guards, promoted
+#
+# Project C tests these, on a single-arm model. Inherited coverage is coverage
+# of the inherited configuration, so both were probed for reachability here
+# before being credited. Both are reachable; the probe found a third thing,
+# which is the arm-parameter gap recorded in PROVENANCE.md.
+
+def test_the_arm_joints_are_all_revolute(body):
+    """The geometric Jacobian in the vendored module is revolute-serial only."""
+    handle, joints, links = body
+    model = _model(body, ["left_panda_hand", "right_panda_hand"])
+    assert len(model.arm_joints) == 14
+
+
+def test_a_prismatic_arm_joint_is_refused(body):
+    """The break: the Panda's fingers are prismatic, so passing one as an arm
+    joint is a plausible slip and would silently produce wrong columns."""
+    handle, joints, links = body
+    arm = [joints[f"{a}_panda_joint{k}"] for a in ("left", "right")
+           for k in range(1, 8)]
+    with pytest.raises(ValueError, match="not revolute"):
+        FloatingBaseModel(handle, arm[:6] + [joints["left_panda_finger_joint1"]],
+                          end_effector=[links["left_panda_hand"]],
+                          inertials=_urdf_inertials(R.MODEL), urdf=str(R.MODEL))
+
+
+def test_the_base_convention_holds_for_both_arms(body):
+    """H_b's leading block is total mass times identity and J_b's is the
+    identity, which is what fixes the base degrees of freedom in
+    [linear, angular] order. Checked for each arm, because the guard now
+    validates the arm it is asked about rather than always arm zero."""
+    model = _model(body, ["left_panda_hand", "right_panda_hand"])
+    q = torch.zeros(14, dtype=torch.float64)
+    for arm in (0, 1):
+        model.generalized_jacobian(q, arm=arm)
+        Jb = model.base_jacobian(q, arm=arm).numpy()
+        assert np.allclose(Jb[:3, :3], np.eye(3), atol=1e-9)
+        assert np.allclose(Jb[3:, :3], 0.0, atol=1e-9)
+
+
+def test_a_mismatched_base_reference_is_refused(body):
+    """The break: the mass matrix and J_b must agree about what the base
+    twist is written about, and only base_com does."""
+    handle, joints, links = body
+    arm = [joints[f"{a}_panda_joint{k}"] for a in ("left", "right")
+           for k in range(1, 8)]
+    model = FloatingBaseModel(handle, arm,
+                              end_effector=[links["left_panda_hand"]],
+                              base_reference="system_com",
+                              inertials=_urdf_inertials(R.MODEL),
+                              urdf=str(R.MODEL))
+    with pytest.raises(ValueError, match="base_com"):
+        model.generalized_jacobian(torch.zeros(14, dtype=torch.float64))
+
+
+def test_a_mis_ordered_mass_matrix_is_caught(body):
+    """The break the H_b branch exists for: base degrees of freedom in the
+    wrong order make the leading block something other than total mass times
+    identity, and every generalized Jacobian downstream would be wrong."""
+    model = _model(body, ["left_panda_hand", "right_panda_hand"])
+    q = torch.zeros(14, dtype=torch.float64)
+    honest = model.coupling
+
+    def wrong(configuration, fingers="exact"):
+        base, coupling = honest(configuration, fingers=fingers)
+        base = base.clone()
+        base[:3, :3] *= 0.5          # no longer total_mass . I
+        return base, coupling
+
+    model.coupling = wrong
+    try:
+        with pytest.raises(AssertionError, match="total_mass"):
+            model.generalized_jacobian(q, arm=0)
+    finally:
+        del model.coupling
